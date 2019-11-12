@@ -1,0 +1,291 @@
+#!/usr/bin/env python2
+
+import numpy as np, torch, torch.nn as nn, torch.optim as optim, torch.distributions as distributions
+import cv2
+import time
+from tensorboardX import SummaryWriter
+import collections, random, time
+import copy
+from env import Env
+
+#------------------------------------------------------------------------------
+# Learning Parameters
+
+EXPLORE_EPISODES = -1
+LR = 1e-4
+SEED = 1
+BATCH = 100
+ENV = "PegInHole"
+B = 3
+LAYER_SIZE = 300 # Neurons per layer
+EPISODES = 1000
+MODEL_SIGMA = 0.01  # Scale of the std dev for the model output gaussian
+
+#------------------------------------------------------------------------------
+# Optimization Parameters
+
+NUM = 50           # Number of parallel trajectories
+ELITE = 5          # Number of elites (for CEM)
+ITERS = 20          # Number of optimization iterations
+LEN = 50            # How long the modelled trajectories are
+GAMMA = 0.1        # Reward weighting factor
+SIGMA_SCALE = 0.2  # Scale of the standard deviation (for reward reweighted opt)
+BETA = 0.7         # Smoothing factor (for reward reweighted opt)
+
+#------------------------------------------------------------------------------
+# Data structures
+#------------------------------------------------------------------------------
+
+Experience = collections.namedtuple("Experience", ("obs", "act", "rew", "nobs", "done"))
+
+#------------------------------------------------------------------------------
+# Classes
+#------------------------------------------------------------------------------
+
+class Ensemble(nn.Module):
+    def __init__(self, obs_size, act_size, B=5):
+        super(Ensemble, self).__init__()
+        # Number of bootstrap models
+        self.B = B
+        self.nets = [Model(obs_size, act_size) for n in range(self.B)]
+
+    def train(self):
+        losses = [net.train() for net in self.nets]
+        return losses
+
+    def forward(self, obs, act):
+        # Sample a bootstrap index, use that model
+        b = random.randint(0,self.B-1)
+        return self.nets[b](obs, act)
+
+#------------------------------------------------------------------------------
+
+class Model(nn.Module):
+    def __init__(self, obs_size, act_size):
+        super(Model, self).__init__()
+        self.obs_size = obs_size
+
+        # Network
+        self.net = nn.Sequential(nn.Linear(obs_size+act_size, LAYER_SIZE), nn.ReLU(),
+                                 nn.Linear(LAYER_SIZE,        LAYER_SIZE), nn.ReLU(),
+                                 nn.Linear(LAYER_SIZE,         obs_size))
+        # Init weights small
+        self.net[-1].weight.data *= 0.01
+        self.net[-1].bias.data   *= 0.01
+
+        # Optim
+        self.optim = optim.Adam(self.net.parameters(), lr = LR)
+
+    def train(self):
+        b = sample_batch()
+        nobs_h = self.forward(b.obs, b.act)
+
+        # Calculate loss of predicted next states
+        loss = nn.functional.smooth_l1_loss(nobs_h, b.nobs)
+
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+        
+        # Log final layer weights for learning visualization
+        writer.add_histogram("weights", self.net[-1].weight.data, update)
+        return loss
+
+    def forward(self, o, a):
+        # Predict the mean next state
+        mean = o.detach() + self.net(torch.cat([o, a], dim=1))
+        # Gaussian around that mean
+        dist = distributions.MultivariateNormal(mean, torch.eye(self.obs_size)*MODEL_SIGMA)
+        n = dist.rsample()
+        return mean
+
+#------------------------------------------------------------------------------
+# Helpers
+#------------------------------------------------------------------------------
+
+def sample_batch():
+    return Experience(*map(lambda x: torch.FloatTensor(x).view(BATCH,-1),
+                      zip(*random.sample(buf, BATCH))))
+
+#------------------------------------------------------------------------------
+
+def cost(obs, act):
+    goal = torch.FloatTensor(env.goal)
+    obs_cost = torch.sum((obs - goal)**2, dim=1)
+    act_cost = torch.sum((act)**2, dim=1)
+
+    Wo = 1.0
+    Wa = 0.0
+    return Wo * obs_cost + Wa * act_cost
+
+#------------------------------------------------------------------------------
+
+def reward_weighted_optimization(obs):
+    o_obs = obs.repeat((NUM,1))
+    mean = torch.zeros((LEN, act_size))
+    sig =  torch.ones ((LEN, act_size))
+    
+    for i in range(ITERS):
+        # Reset starting point
+        obs = o_obs
+        # ret = cost(obs)
+        ret = torch.zeros((NUM, ))
+
+        # Sample actions
+        dist = distributions.Normal(mean, sig)
+        act = torch.clamp(dist.sample_n(NUM), -1, 1)
+        # Rollout
+        for ts in range(LEN):
+            obs = model(obs, act[:,ts])
+            ret += cost(obs, act[:,ts])
+
+        # Re-weight the returns and calculate new mean
+        r_s = nn.functional.softmax(GAMMA*ret, dim=0)
+        weighted = act * r_s.view(NUM,1,1)
+        mean = torch.sum(weighted, dim=0)
+
+        # Low pass filter the action means through time
+        for t in range(LEN - 1):
+          mean[t+1] = BETA*mean[t+1] + (1-BETA)*mean[t]
+
+        sig =  torch.ones ((LEN, act_size))*SIGMA_SCALE
+    ind = torch.argmin(ret)
+    return act[ind,0]
+
+#------------------------------------------------------------------------------
+
+def cem(obs):
+    img = None
+    o_obs = obs.repeat((NUM,1))
+    mean = torch.zeros((LEN, act_size))
+    sig =  torch.ones ((LEN, act_size))
+    
+    for i in range(ITERS):
+        obs_list = []
+        # Reset starting point
+        obs = o_obs
+        ret = torch.zeros((NUM, ))
+
+        # Sample actions
+        dist = distributions.Normal(mean, sig) # Scale of the standard deviation
+        act = torch.clamp(dist.sample_n(NUM), -1, 1)
+
+        # Rollout
+        for ts in range(LEN):
+            nobs = model(obs, act[:,ts])
+            ret += cost(obs, act[:,ts])
+            obs = nobs
+            obs_list.append(obs.detach().numpy())
+
+        # Get elite and sample new actions
+        inds = torch.argsort(ret)[:ELITE]
+        mean = torch.mean(act[inds], dim=0)
+        sig  = torch.std(act[inds], dim=0)
+
+        if ep >= 1:
+          img = visualize_trajectories(obs_list, inds, iteration=i, img=img)
+
+    return act[inds[0],0]*0.5
+
+
+def visualize_trajectories(obs_list, elite_inds=None, iteration=0, img=None):
+    trajectories = []
+    for n in range(NUM):
+      traj = [obs[n] for obs in obs_list]
+      trajectories.append(traj)
+    img = env.render(trajectories=trajectories, iteration=iteration, img=img)
+    return img
+
+    # if elite_inds is not None:
+    #   elite_trajs = []
+    #   for n in elite_inds:
+    #     traj = [obs[n] for obs in obs_list]
+    #     elite_trajs.append(traj)
+    #   env.render(trajectories=elite_trajs, iteration=iteration)
+
+#------------------------------------------------------------------------------
+
+def random_shooting(obs):
+    obs_list = []
+    obs = obs.repeat((NUM,1))
+    act = torch.clamp(torch.randn((NUM, LEN, act_size)), -1, 1)
+    ret = torch.zeros((NUM, ))
+    for ts in range(LEN):
+        nobs = model(obs, act[:,ts])
+        ret += cost(obs, act[:,ts])
+        obs = nobs
+
+        obs_list.append(obs.detach().numpy())
+    i = torch.argmin(ret)
+
+    visualize_trajectories(obs_list)
+    return act[i,0]
+
+#------------------------------------------------------------------------------
+
+def select_action(obs):
+    if ep <= EXPLORE_EPISODES:
+        act = env.action_space.sample()*0.5
+    else:
+        obs = torch.FloatTensor(obs)
+        act = cem(obs).numpy()
+    return act
+
+#------------------------------------------------------------------------------
+
+def episode():
+    # Run an episode in the environment, return the episode return
+    global update
+    done = False
+    t = 0; ret = 0
+    obs = env.reset()
+
+    while not done:
+        act = select_action(obs)
+
+        nobs, _, done, _ = env.step(act)
+
+        rew = -cost(torch.FloatTensor(nobs).view(1,-1), torch.FloatTensor(act).view(1,-1))
+
+        if ep >= 1:
+          env.render([nobs])
+
+        buf.append(Experience(obs, act, rew, nobs, done))
+        obs = copy.deepcopy(nobs)
+        ret += rew
+        if len(buf) > BATCH:
+            losses = model.train()
+            for i, loss in enumerate(losses):
+                writer.add_scalar("{}/model{}".format(ENV, i), loss, update)
+            update += 1
+
+    return ret
+
+#------------------------------------------------------------------------------
+# Run
+#------------------------------------------------------------------------------
+
+# Seed the random number generators
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
+
+# Create the environment
+env = Env()
+# obs_size = env.observation_space.shape[0]
+# act_size = env.action_space.shape[0]
+obs_size = 6
+act_size = 3
+
+# Create the data logger
+writer = SummaryWriter(comment="CEM-Ensemble{}".format(B))
+
+# Create the model and replay buffer
+model = Ensemble(obs_size, act_size, B=B)
+buf = []
+
+# Run the training process
+update = 0
+for ep in range(EPISODES):
+    ret = episode()
+    writer.add_scalar("{}/{}".format(ENV, "Return"), ret, ep)
