@@ -6,8 +6,7 @@ Based on [PETS](https://arxiv.org/abs/1805.12114) and [PDDM](https://bair.berkel
 
 A simple 3D point mass environment, created to allow for visualisations of the trajectory optimization procedure.
 
-![img](img1.png)
-![img](img2.png)
+![img](cemfast.gif)
 
 
 
